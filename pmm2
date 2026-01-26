@@ -1,0 +1,42 @@
+using System;
+using System.Text.Json.Serialization;
+
+// 1. 定義事件類型 (封包的生命週期狀態)
+public enum PmmEventId
+{
+    Unknown = 0,
+    Connect = 1,      // 連線 (通常用於 Handshake)
+    Heartbeat = 2,    // 心跳
+    Disconnect = 3,   // 斷線
+    RP = 10,          // Response (單次請求的回覆)
+    PB = 20           // Publish/Broadcast (訂閱後的推送)
+}
+
+// 2. 定義功能類型 (業務邏輯)
+public enum PmmFunctionId
+{
+    None = 0,
+    QueryPrice = 101,     // 查詢價格
+    QueryKLine = 102,     // 查詢 K 線
+    SubscribePrice = 201, // 訂閱價格
+    SubscribeKLine = 202  // 訂閱 K 線
+}
+
+// 3. 基礎封包結構
+public class PmmPacket
+{
+    public PmmEventId EventId { get; set; }
+    public PmmFunctionId FunctionId { get; set; }
+    public string Symbol { get; set; } // 標的，例如 "BTC", "AAPL"
+    
+    // 這裡放具體資料，實務上可能是個 Object 或泛型，
+    // 為了範例簡單，我們用字串存 JSON Payload
+    public string Payload { get; set; } 
+}
+
+// 4. 事件參數
+public class PmmEventArgs : EventArgs
+{
+    public PmmPacket Packet { get; set; }
+    public Type OriginalRequestType { get; set; }
+}
