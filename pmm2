@@ -1,42 +1,219 @@
 using System;
-using System.Text.Json.Serialization;
+using System.Collections.Concurrent;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
-// 1. 定義事件類型 (封包的生命週期狀態)
-public enum PmmEventId
+public class PmmClient : IDisposable
 {
-    Unknown = 0,
-    Connect = 1,      // 連線 (通常用於 Handshake)
-    Heartbeat = 2,    // 心跳
-    Disconnect = 3,   // 斷線
-    RP = 10,          // Response (單次請求的回覆)
-    PB = 20           // Publish/Broadcast (訂閱後的推送)
-}
+    private TcpClient _client;
+    private NetworkStream _stream;
+    private CancellationTokenSource _cts;
+    private Task _receiveTask;
 
-// 2. 定義功能類型 (業務邏輯)
-public enum PmmFunctionId
-{
-    None = 0,
-    QueryPrice = 101,     // 查詢價格
-    QueryKLine = 102,     // 查詢 K 線
-    SubscribePrice = 201, // 訂閱價格
-    SubscribeKLine = 202  // 訂閱 K 線
-}
+    public event EventHandler<PmmEventArgs> OnRP;
+    public event EventHandler<PmmEventArgs> OnPB;
 
-// 3. 基礎封包結構
-public class PmmPacket
-{
-    public PmmEventId EventId { get; set; }
-    public PmmFunctionId FunctionId { get; set; }
-    public string Symbol { get; set; } // 標的，例如 "BTC", "AAPL"
+    // --- 狀態管理 (使用 FunctionId + Symbol 作為 Key) ---
     
-    // 這裡放具體資料，實務上可能是個 Object 或泛型，
-    // 為了範例簡單，我們用字串存 JSON Payload
-    public string Payload { get; set; } 
-}
+    // 記錄正在等待回覆的單次請求：Key -> RequestType
+    private readonly ConcurrentDictionary<string, Type> _pendingRequests 
+        = new ConcurrentDictionary<string, Type>();
 
-// 4. 事件參數
-public class PmmEventArgs : EventArgs
-{
-    public PmmPacket Packet { get; set; }
-    public Type OriginalRequestType { get; set; }
+    // 記錄正在監聽的訂閱：Key -> RequestType
+    private readonly ConcurrentDictionary<string, Type> _activeSubscriptions 
+        = new ConcurrentDictionary<string, Type>();
+
+    public bool IsConnected => _client != null && _client.Connected;
+
+    public async Task ConnectAsync(string ip, int port)
+    {
+        if (IsConnected) return;
+        _client = new TcpClient();
+        await _client.ConnectAsync(ip, port);
+        _stream = _client.GetStream();
+        _cts = new CancellationTokenSource();
+        _receiveTask = Task.Run(ReceiveLoop, _cts.Token);
+        Console.WriteLine($"[PmmClient] Connected to {ip}:{port}");
+        
+        // 通常連線後會發送一個 Connect Event
+        SendPacket(new PmmPacket { EventId = PmmEventId.Connect });
+    }
+
+    // --- 輔助：產生邏輯 Key ---
+    private string GetLogicKey(PmmFunctionId funcId, string symbol)
+    {
+        // Key 的格式例如: "101_BTC" (查詢價格_BTC)
+        return $"{funcId}_{symbol?.ToUpper()}"; 
+    }
+
+    // --- 功能方法 ---
+
+    /// <summary>
+    /// 發送單次請求 (Request)
+    /// </summary>
+    public void Request<T>(T packet) where T : PmmPacket
+    {
+        // 1. 產生 Key
+        string key = GetLogicKey(packet.FunctionId, packet.Symbol);
+
+        // 2. 記錄這筆請求 (覆寫舊的也沒關係，因為是 Request-Response 模型)
+        _pendingRequests[key] = typeof(T);
+
+        // 3. 發送
+        SendPacket(packet);
+    }
+
+    /// <summary>
+    /// 發送訂閱請求 (Subscribe)
+    /// </summary>
+    public void Subscribe<T>(T packet) where T : PmmPacket
+    {
+        // 1. 產生 Key
+        string key = GetLogicKey(packet.FunctionId, packet.Symbol);
+
+        // 2. 記錄訂閱狀態
+        _activeSubscriptions[key] = typeof(T);
+
+        // 3. 發送
+        SendPacket(packet);
+    }
+
+    private void SendPacket(PmmPacket packet)
+    {
+        if (!IsConnected) return;
+        
+        try
+        {
+            string json = JsonSerializer.Serialize(packet);
+            byte[] data = Encoding.UTF8.GetBytes(json);
+            byte[] lenBytes = BitConverter.GetBytes(data.Length);
+
+            lock (_stream)
+            {
+                _stream.Write(lenBytes, 0, lenBytes.Length);
+                _stream.Write(data, 0, data.Length);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Send Error] {ex.Message}");
+        }
+    }
+
+    // --- 接收迴圈 ---
+    private async Task ReceiveLoop()
+    {
+        byte[] lenBuf = new byte[4];
+        try
+        {
+            while (!_cts.Token.IsCancellationRequested && IsConnected)
+            {
+                if (await ReadExactAsync(lenBuf, 4) == 0) break;
+                int bodyLen = BitConverter.ToInt32(lenBuf, 0);
+
+                byte[] bodyBuf = new byte[bodyLen];
+                if (await ReadExactAsync(bodyBuf, bodyLen) == 0) break;
+
+                string json = Encoding.UTF8.GetString(bodyBuf);
+                ProcessIncomingPacket(json);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Receive Error] {ex.Message}");
+        }
+        finally { Disconnect(); }
+    }
+
+    private void ProcessIncomingPacket(string json)
+    {
+        try
+        {
+            var packet = JsonSerializer.Deserialize<PmmPacket>(json);
+            if (packet == null) return;
+
+            // 根據 EventId 分流處理
+            switch (packet.EventId)
+            {
+                case PmmEventId.Heartbeat:
+                    Console.WriteLine("[Heartbeat] Received");
+                    // 可以在這裡自動回覆 Heartbeat
+                    break;
+
+                case PmmEventId.RP: // 單次請求回覆
+                    HandleRP(packet);
+                    break;
+
+                case PmmEventId.PB: // 訂閱推送
+                    HandlePB(packet);
+                    break;
+
+                case PmmEventId.Connect:
+                case PmmEventId.Disconnect:
+                    Console.WriteLine($"[System Event] {packet.EventId}");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Parse Error] {ex.Message}");
+        }
+    }
+
+    private void HandleRP(PmmPacket packet)
+    {
+        // 使用 FunctionId + Symbol 找回當初的 Request 型別
+        string key = GetLogicKey(packet.FunctionId, packet.Symbol);
+
+        if (_pendingRequests.TryRemove(key, out Type originalType))
+        {
+            OnRP?.Invoke(this, new PmmEventArgs 
+            { 
+                Packet = packet, 
+                OriginalRequestType = originalType 
+            });
+        }
+        else
+        {
+            // 可能是逾時的封包，或是重複發送的
+            Console.WriteLine($"[Info] Unmatched RP received for key: {key}");
+        }
+    }
+
+    private void HandlePB(PmmPacket packet)
+    {
+        string key = GetLogicKey(packet.FunctionId, packet.Symbol);
+
+        // 訂閱是持續性的，所以用 TryGetValue (不移除)
+        if (_activeSubscriptions.TryGetValue(key, out Type originalType))
+        {
+            OnPB?.Invoke(this, new PmmEventArgs 
+            { 
+                Packet = packet, 
+                OriginalRequestType = originalType 
+            });
+        }
+    }
+
+    private async Task<int> ReadExactAsync(byte[] buffer, int length)
+    {
+        int total = 0;
+        while (total < length)
+        {
+            int read = await _stream.ReadAsync(buffer, total, length - total, _cts.Token);
+            if (read == 0) return 0;
+            total += read;
+        }
+        return total;
+    }
+
+    public void Disconnect()
+    {
+        _cts?.Cancel();
+        _client?.Close();
+    }
+    public void Dispose() => Disconnect();
 }
